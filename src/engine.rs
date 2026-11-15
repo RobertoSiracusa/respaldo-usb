@@ -17,7 +17,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, TryLockError};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -320,18 +320,27 @@ fn plan_sources(job: &Job, sum: &mut Summary) -> Vec<PathBuf> {
     plan
 }
 
+fn compile_pattern(pattern: &str) -> Result<globset::Glob, globset::Error> {
+    GlobBuilder::new(pattern)
+        .case_insensitive(true)
+        .literal_separator(false)
+        .build()
+}
+
+/// Patrones de exclusión mal escritos (por ejemplo, un corchete sin cerrar).
+pub fn invalid_patterns(patterns: &[String]) -> Vec<String> {
+    patterns
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty() && compile_pattern(p).is_err())
+        .map(String::from)
+        .collect()
+}
+
 fn build_excludes(patterns: &[String]) -> GlobSet {
     let mut b = GlobSetBuilder::new();
-    for p in patterns {
-        let p = p.trim();
-        if p.is_empty() {
-            continue;
-        }
-        if let Ok(g) = GlobBuilder::new(p)
-            .case_insensitive(true)
-            .literal_separator(false)
-            .build()
-        {
+    for p in patterns.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        if let Ok(g) = compile_pattern(p) {
             b.add(g);
         }
     }
@@ -382,20 +391,65 @@ fn set_aside(path: &Path, stamp: &str) -> io::Result<PathBuf> {
     Ok(to)
 }
 
+fn is_tmp_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("~respaldo") && n.ends_with(".tmp"))
+}
+
 /// Impide que dos procesos respalden o verifiquen a la vez la misma carpeta.
 /// El sistema libera el bloqueo al cerrarse el archivo, incluso si el proceso muere.
-fn acquire_lock(host_dir: &Path) -> Result<File, String> {
-    let path = host_dir.join(LOCK_NAME);
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| format!("no se pudo escribir en el disco de respaldo ({}): {e}", path.display()))?;
-    match file.try_lock() {
-        Err(TryLockError::WouldBlock) => Err("otro respaldo o verificación está usando este disco".into()),
+///
+/// El mismo archivo sirve de diario: guarda la ruta del temporal que se está
+/// escribiendo, para borrarlo en el siguiente arranque si hubo un corte.
+struct Lock {
+    file: File,
+}
+
+impl Lock {
+    fn acquire(host_dir: &Path) -> Result<Self, String> {
+        let path = host_dir.join(LOCK_NAME);
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("no se pudo escribir en el disco de respaldo ({}): {e}", path.display()))?;
         // Si el sistema de archivos no admite bloqueos, se sigue sin él.
-        _ => Ok(file),
+        if let Err(TryLockError::WouldBlock) = file.try_lock() {
+            return Err("otro respaldo o verificación está usando este disco".into());
+        }
+        let mut lock = Self { file };
+        lock.remove_orphan(host_dir);
+        Ok(lock)
+    }
+
+    /// Borra el temporal que dejó a medias una corrida interrumpida.
+    fn remove_orphan(&mut self, host_dir: &Path) {
+        let mut noted = String::new();
+        let _ = self.file.seek(SeekFrom::Start(0));
+        let _ = self.file.read_to_string(&mut noted);
+        let orphan = PathBuf::from(noted.trim());
+        if is_tmp_name(&orphan) && path_contains(host_dir, &orphan) {
+            let _ = fs::remove_file(&orphan);
+        }
+        self.clear();
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(bytes)?;
+        self.file.set_len(bytes.len() as u64)
+    }
+
+    /// Anota el temporal que se va a escribir.
+    fn note(&mut self, tmp: &Path) {
+        let _ = self.write(tmp.to_string_lossy().as_bytes());
+    }
+
+    fn clear(&mut self) {
+        let _ = self.write(b"");
     }
 }
 
@@ -592,7 +646,7 @@ fn backup_inner(job: &Job, rep: &Reporter, sum: &mut Summary) -> Result<(), Canc
         sum.fatal = Some(format!("no se pudo crear {}: {e}", job.host_dir.display()));
         return Ok(());
     }
-    let _lock = match acquire_lock(&job.host_dir) {
+    let mut lock = match Lock::acquire(&job.host_dir) {
         Ok(f) => f,
         Err(msg) => {
             sum.fatal = Some(msg);
@@ -629,6 +683,10 @@ fn backup_inner(job: &Job, rep: &Reporter, sum: &mut Summary) -> Result<(), Canc
             "Permisos NTFS sin privilegios de administrador: puede haber archivos con acceso denegado. Ejecuta la app como administrador."
                 .into(),
         );
+    }
+    for bad in invalid_patterns(&job.excludes) {
+        sum.notes
+            .push(format!("Patrón de exclusión mal escrito, ignorado: {bad}"));
     }
     let sources = plan_sources(job, sum);
 
@@ -843,6 +901,7 @@ fn backup_inner(job: &Job, rep: &Reporter, sum: &mut Summary) -> Result<(), Canc
                 if let Some(parent) = dest.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
+                lock.note(&dest.with_file_name(tmp_name()));
                 match copy_file(src_path, &dest, job.verify_after_copy, rep, buf.get(), !already_read) {
                     Ok((hash, copied)) => {
                         let mtime = meta.as_ref().map(mtime_secs).unwrap_or(0);
@@ -892,6 +951,7 @@ fn backup_inner(job: &Job, rep: &Reporter, sum: &mut Summary) -> Result<(), Canc
         }
     }
 
+    lock.clear();
     sum.only_in_backup = manifest
         .files
         .keys()
@@ -934,7 +994,7 @@ pub fn run_verify(host_dir: &Path, rep: &Reporter) -> Summary {
 }
 
 fn verify_inner(host_dir: &Path, rep: &Reporter, sum: &mut Summary) {
-    let _lock = match acquire_lock(host_dir) {
+    let _lock = match Lock::acquire(host_dir) {
         Ok(f) => f,
         Err(msg) => {
             sum.fatal = Some(msg);
@@ -1227,13 +1287,56 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         let rep = Reporter::default();
 
-        let held = acquire_lock(&host).unwrap();
+        let held = Lock::acquire(&host).unwrap();
         let s = run_backup(&job(src_dir.path(), &host), &rep);
         assert!(s.fatal.is_some());
         assert_eq!(s.copied, 0);
         assert!(run_verify(&host, &rep).fatal.is_some());
         drop(held);
         assert!(run_backup(&job(src_dir.path(), &host), &rep).ok());
+    }
+
+    #[test]
+    fn orphan_temp_from_interrupted_run_is_removed() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let disk = tempfile::tempdir().unwrap();
+        let src = src_dir.path();
+        let host = disk.path().join("srv1");
+        fs::write(src.join("a.txt"), "a").unwrap();
+        let rep = Reporter::default();
+        assert!(run_backup(&job(src, &host), &rep).ok());
+
+        // Simula un corte: quedó un temporal a medias y su ruta anotada en el diario.
+        let orphan = dest_of(src, &host, "~respaldo-99999.tmp");
+        fs::write(&orphan, "a medias").unwrap();
+        fs::write(host.join(LOCK_NAME), orphan.to_string_lossy().as_bytes()).unwrap();
+        // El diario nunca debe servir para borrar otra cosa.
+        let innocent = dest_of(src, &host, "a.txt");
+
+        assert!(run_backup(&job(src, &host), &rep).ok());
+        assert!(!orphan.exists());
+        assert!(innocent.exists());
+        assert_eq!(fs::read(host.join(LOCK_NAME)).unwrap(), b"");
+
+        fs::write(host.join(LOCK_NAME), innocent.to_string_lossy().as_bytes()).unwrap();
+        assert!(run_verify(&host, &rep).ok());
+        assert!(innocent.exists());
+    }
+
+    #[test]
+    fn invalid_exclude_patterns_are_reported() {
+        let patterns = vec!["*.tmp".to_string(), "[abc".to_string(), "  ".to_string()];
+        assert_eq!(invalid_patterns(&patterns), vec!["[abc".to_string()]);
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let disk = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.txt"), "a").unwrap();
+        fs::write(src_dir.path().join("b.tmp"), "b").unwrap();
+        let mut j = job(src_dir.path(), &disk.path().join("h"));
+        j.excludes = patterns;
+        let s = run_backup(&j, &Reporter::default());
+        assert!(s.ok(), "{s:?}");
+        assert_eq!((s.copied, s.notes.len()), (1, 1));
     }
 
     #[test]

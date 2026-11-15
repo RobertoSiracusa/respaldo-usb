@@ -18,7 +18,10 @@ Respaldo incremental de carpetas de un servidor Windows a un disco extraíble. R
 - Se conservan fechas y atributos (solo lectura, oculto, sistema). Opcional: permisos NTFS, si el disco es NTFS.
 - Archivos en uso se omiten y quedan en el reporte. Enlaces simbólicos y uniones se omiten y se cuentan aparte.
 - Ejecutada como administrador, lee archivos aunque sus permisos no lo permitan (privilegio de respaldo).
-- Cerrar la ventana la oculta en la bandeja. Salir: menú del icono de bandeja.
+- Cerrar la ventana la oculta en la bandeja. Clic en el icono la abre; clic derecho, menú con Salir.
+- Con varios discos de respaldo conectados, se elige el destino en la pantalla principal.
+- Si un corte deja un temporal a medias, se borra solo en la siguiente corrida.
+- Se conservan los 200 reportes más recientes.
 
 Configuración, estado, reportes y `errores.log`: `%ProgramData%\RespaldoUSB\`.
 
@@ -61,6 +64,7 @@ RESPALDO_DISCOS_PRUEBA=/ruta/carpeta cargo run
 
 - El respaldo automático necesita la app abierta, es decir, una sesión iniciada. No es un servicio de Windows.
 - Un disco ya conectado al abrir la app no dispara respaldo automático; solo los que se conectan después.
+- Al iniciar con Windows la ventana aparece un instante antes de ocultarse en la bandeja.
 - No usa VSS: bases de datos y archivos abiertos en exclusiva se omiten.
 - No copia flujos de datos alternativos (ADS) de NTFS.
 - Un archivo modificado necesita espacio libre para la copia nueva antes de reemplazar la anterior.

@@ -9,13 +9,15 @@ use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const GREEN: egui::Color32 = egui::Color32::from_rgb(40, 150, 70);
 const ORANGE: egui::Color32 = egui::Color32::from_rgb(200, 120, 0);
 const RED: egui::Color32 = egui::Color32::from_rgb(210, 50, 50);
 /// Días sin respaldo terminado a partir de los cuales se avisa en color.
 const STALE_DAYS: i64 = 7;
+/// Plazo para ocultar la ventana al iniciar con Windows; pasado ese tiempo ya no se oculta sola.
+const HIDE_WINDOW_WITHIN: Duration = Duration::from_secs(10);
 
 fn local_time(unix_secs: i64) -> Option<chrono::DateTime<chrono::Local>> {
     chrono::DateTime::from_timestamp(unix_secs, 0).map(|t| t.with_timezone(&chrono::Local))
@@ -36,7 +38,11 @@ pub struct App {
     message: Option<String>,
     autostart: bool,
     quit: Arc<AtomicBool>,
-    start_hidden: bool,
+    /// Ocultar la ventana en cuanto aparezca (inicio con Windows). Se anula si el usuario la pide antes.
+    hide_pending: Arc<AtomicBool>,
+    started: Instant,
+    /// Disco elegido cuando hay más de uno conectado (id del marcador).
+    selected_disk: Option<String>,
     has_tray: bool,
     #[cfg(windows)]
     _tray: Option<tray_icon::TrayIcon>,
@@ -50,6 +56,7 @@ impl App {
             move || ctx.request_repaint()
         }));
         let quit = Arc::new(AtomicBool::new(false));
+        let hide_pending = Arc::new(AtomicBool::new(start_hidden));
 
         #[cfg(windows)]
         let tray = {
@@ -59,7 +66,16 @@ impl App {
                 _ => 0,
             };
             ctl.hwnd.store(hwnd, Ordering::Relaxed);
-            platform::tray::create(hwnd, quit.clone(), move || ctx.request_repaint())
+            // El usuario pide la ventana: ya no hay que ocultarla, y la interfaz debe despertar.
+            let on_show = {
+                let (ctx, pending) = (ctx.clone(), hide_pending.clone());
+                move || {
+                    pending.store(false, Ordering::Relaxed);
+                    ctx.request_repaint();
+                }
+            };
+            platform::listen_show_requests(hwnd, on_show.clone());
+            platform::tray::create(hwnd, quit.clone(), on_show)
         };
         #[cfg(windows)]
         let has_tray = tray.is_some();
@@ -76,7 +92,9 @@ impl App {
             message: None,
             autostart: platform::autostart_enabled(),
             quit,
-            start_hidden: start_hidden && has_tray,
+            hide_pending,
+            started: Instant::now(),
+            selected_disk: None,
             has_tray,
             #[cfg(windows)]
             _tray: tray,
@@ -98,7 +116,26 @@ impl App {
         let running = self.ctl.is_running();
         let n_sources = lock(&self.ctl.config).sources.len();
 
-        match ready.first() {
+        let chosen = ready
+            .iter()
+            .position(|d| d.marker.as_ref().map(|m| &m.id) == self.selected_disk.as_ref())
+            .unwrap_or(0);
+        match ready.get(chosen) {
+            Some(d) if ready.len() > 1 => {
+                ui.add_enabled_ui(!running, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Disco de destino:").color(GREEN).strong());
+                        egui::ComboBox::from_id_salt("disco_destino")
+                            .selected_text(drive_title(d))
+                            .show_ui(ui, |ui| {
+                                for option in &ready {
+                                    let id = option.marker.as_ref().map(|m| m.id.clone());
+                                    ui.selectable_value(&mut self.selected_disk, id, drive_title(option));
+                                }
+                            });
+                    });
+                });
+            }
             Some(d) => {
                 ui.label(
                     egui::RichText::new(format!("Disco conectado: {}", drive_title(d)))
@@ -156,14 +193,14 @@ impl App {
                 let can = !ready.is_empty() && n_sources > 0;
                 let big = egui::Button::new(egui::RichText::new("Respaldar ahora").size(18.0));
                 if ui.add_enabled(can, big).clicked() {
-                    self.ctl.start_backup(&ready[0].root);
+                    self.ctl.start_backup(&ready[chosen].root);
                 }
                 if ui
                     .add_enabled(!ready.is_empty(), egui::Button::new("Verificar disco"))
                     .on_hover_text("Relee todo el respaldo de este servidor y lo compara con los hashes guardados. Lo dañado se vuelve a copiar en el siguiente respaldo.")
                     .clicked()
                 {
-                    self.ctl.start_verify(&ready[0].root);
+                    self.ctl.start_verify(&ready[chosen].root);
                 }
             });
         }
@@ -343,6 +380,10 @@ impl App {
             self.save_config();
         }
         ui.label(egui::RichText::new("Ejemplos: *.tmp   ~$*   node_modules   *\\Cache\\*").small());
+        let bad = engine::invalid_patterns(&lock(&self.ctl.config).excludes);
+        if !bad.is_empty() {
+            ui.label(egui::RichText::new(format!("Patrones mal escritos, se ignoran: {}", bad.join("   "))).color(RED));
+        }
     }
 
     fn tab_disks(&mut self, ui: &mut egui::Ui) {
@@ -500,9 +541,17 @@ impl App {
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.start_hidden {
-            self.start_hidden = false;
-            platform::hide_window(self.hwnd());
+        // eframe muestra la ventana tras pintar el primer cuadro; se oculta en cuanto aparece.
+        // Sin bandeja no se oculta: no habría forma de volver a abrirla.
+        if self.hide_pending.load(Ordering::Relaxed) {
+            if !self.has_tray || self.started.elapsed() > HIDE_WINDOW_WITHIN {
+                self.hide_pending.store(false, Ordering::Relaxed);
+            } else if platform::is_visible(self.hwnd()) {
+                self.hide_pending.store(false, Ordering::Relaxed);
+                platform::hide_window(self.hwnd());
+            } else {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
         }
 
         let quitting = self.quit.load(Ordering::Relaxed);

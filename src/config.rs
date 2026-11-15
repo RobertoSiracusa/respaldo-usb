@@ -24,6 +24,10 @@ pub struct Config {
     pub auto_on_connect: bool,
     /// Releer cada archivo copiado para confirmar que quedó bien escrito.
     pub verify_after_copy: bool,
+    /// Copiar permisos NTFS a la copia (requiere disco NTFS).
+    pub preserve_acl: bool,
+    /// Identificador de este equipo; distingue servidores con el mismo nombre.
+    pub machine_id: String,
 }
 
 impl Default for Config {
@@ -39,15 +43,26 @@ impl Default for Config {
             disks: Vec::new(),
             auto_on_connect: true,
             verify_after_copy: true,
+            preserve_acl: false,
+            machine_id: String::new(),
         }
     }
 }
 
-/// Carpeta de datos de la app (config y reportes).
+/// Carpeta de datos de la app (config, estado y reportes). Es de la máquina, no del
+/// usuario: todos los administradores del servidor ven la misma configuración.
 pub fn data_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(APP_DIR)
+    if cfg!(windows)
+        && let Some(base) = std::env::var_os("ProgramData")
+    {
+        return PathBuf::from(base).join(APP_DIR);
+    }
+    legacy_data_dir()
+}
+
+/// Ubicación por usuario que usaba la versión 0.1.0.
+fn legacy_data_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join(APP_DIR)
 }
 
 pub fn logs_dir() -> PathBuf {
@@ -60,10 +75,28 @@ fn config_path() -> PathBuf {
 
 impl Config {
     pub fn load() -> Self {
-        std::fs::read(config_path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        let read = |path: PathBuf| -> Option<Config> { serde_json::from_slice(&std::fs::read(path).ok()?).ok() };
+        let current = read(config_path());
+        let migrated = current.is_none();
+        let mut cfg = current
+            .or_else(|| read(legacy_data_dir().join("config.json")))
+            .unwrap_or_default();
+        if cfg.machine_id.is_empty() {
+            // Preferir el identificador de Windows: es el mismo aunque no se pueda guardar la configuración.
+            let seed = crate::platform::machine_guid().unwrap_or_else(|| {
+                format!(
+                    "{:?}|{}|{}",
+                    std::time::SystemTime::now(),
+                    std::process::id(),
+                    hostname()
+                )
+            });
+            cfg.machine_id = blake3::hash(seed.as_bytes()).to_hex()[..16].to_string();
+            let _ = cfg.save();
+        } else if migrated {
+            let _ = cfg.save();
+        }
+        cfg
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -89,7 +122,13 @@ pub fn hostname() -> String {
     let clean: String = raw
         .trim()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if clean.is_empty() { "equipo".into() } else { clean }
 }

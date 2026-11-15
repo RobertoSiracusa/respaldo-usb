@@ -58,35 +58,55 @@ pub fn register(root: &Path, name: &str) -> io::Result<DiskMarker> {
     Ok(marker)
 }
 
-pub fn list_drives() -> Vec<Drive> {
-    let mut drives = imp::list();
-    // Para pruebas: carpetas que se tratan como discos (separadas por ';').
-    if let Ok(extra) = std::env::var("RESPALDO_DISCOS_PRUEBA") {
-        for p in extra.split(';').filter(|p| !p.is_empty()) {
-            let root = PathBuf::from(p);
-            if root.is_dir() {
-                drives.push(Drive {
-                    label: "prueba".into(),
-                    filesystem: String::new(),
-                    total: None,
-                    free: None,
-                    removable: true,
-                    marker: None,
-                    root,
-                });
+/// Foto de los discos conectados, con lo necesario para saber sin tocar los
+/// discos si algo cambió desde entonces.
+pub struct Snapshot {
+    pub drives: Vec<Drive>,
+    /// Huella barata de las unidades presentes (en Windows, máscara de letras).
+    token: u64,
+    /// Unidades con letra pero aún sin medio legible (lector vacío, disco bloqueado o arrancando).
+    pending: Vec<PathBuf>,
+}
+
+impl Snapshot {
+    /// Lee todos los discos: los despierta si estaban en reposo. Usar solo cuando haga falta.
+    pub fn take() -> Self {
+        let token = imp::token();
+        let (mut drives, pending) = imp::list();
+        // Para pruebas: carpetas que se tratan como discos (separadas por ';').
+        if let Ok(extra) = std::env::var("RESPALDO_DISCOS_PRUEBA") {
+            for p in extra.split(';').filter(|p| !p.is_empty()) {
+                let root = PathBuf::from(p);
+                if root.is_dir() {
+                    drives.push(Drive {
+                        label: "prueba".into(),
+                        filesystem: String::new(),
+                        total: None,
+                        free: None,
+                        removable: true,
+                        marker: None,
+                        root,
+                    });
+                }
             }
         }
+        for d in &mut drives {
+            d.marker = read_marker(&d.root);
+        }
+        Self { drives, token, pending }
     }
-    for d in &mut drives {
-        d.marker = read_marker(&d.root);
+
+    /// `true` si se conectó o quitó una unidad, o si una pendiente ya está lista.
+    /// No lee los discos ya conocidos, así que no les impide entrar en reposo.
+    pub fn is_stale(&self) -> bool {
+        imp::token() != self.token || self.pending.iter().any(|root| imp::is_ready(root))
     }
-    drives
 }
 
 #[cfg(windows)]
 mod imp {
     use super::Drive;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use windows_sys::Win32::Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
     };
@@ -101,9 +121,46 @@ mod imp {
         String::from_utf16_lossy(&buf[..len])
     }
 
-    pub fn list() -> Vec<Drive> {
-        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_ascii_uppercase();
-        let mut out = Vec::new();
+    fn wide(root: &Path) -> Vec<u16> {
+        root.to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    /// Máscara de letras de unidad: se consulta en memoria, sin acceso a disco.
+    pub fn token() -> u64 {
+        unsafe { GetLogicalDrives() as u64 }
+    }
+
+    /// Etiqueta y sistema de archivos si el volumen ya es legible.
+    fn volume_info(root: &Path) -> Option<(String, String)> {
+        let mut label = [0u16; 261];
+        let mut fs = [0u16; 261];
+        let ok = unsafe {
+            GetVolumeInformationW(
+                wide(root).as_ptr(),
+                label.as_mut_ptr(),
+                label.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                fs.as_mut_ptr(),
+                fs.len() as u32,
+            )
+        };
+        (ok != 0).then(|| (from_wide(&label), from_wide(&fs)))
+    }
+
+    pub fn is_ready(root: &Path) -> bool {
+        volume_info(root).is_some()
+    }
+
+    pub fn list() -> (Vec<Drive>, Vec<PathBuf>) {
+        let system = std::env::var("SystemDrive")
+            .unwrap_or_else(|_| "C:".into())
+            .to_ascii_uppercase();
+        let (mut ready, mut pending) = (Vec::new(), Vec::new());
         // Evita el diálogo "no hay disco en la unidad" de lectores de tarjetas vacíos.
         unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
         let mask = unsafe { GetLogicalDrives() };
@@ -115,54 +172,53 @@ mod imp {
             if system.starts_with(letter) {
                 continue;
             }
-            let root = format!("{letter}:\\");
-            let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
-            let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
+            let root = PathBuf::from(format!("{letter}:\\"));
+            let w = wide(&root);
+            let kind = unsafe { GetDriveTypeW(w.as_ptr()) };
             if kind != DRIVE_REMOVABLE && kind != DRIVE_FIXED {
                 continue;
             }
-            let mut label = [0u16; 261];
-            let mut fs = [0u16; 261];
-            let ok = unsafe {
-                GetVolumeInformationW(
-                    wide.as_ptr(),
-                    label.as_mut_ptr(),
-                    label.len() as u32,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    fs.as_mut_ptr(),
-                    fs.len() as u32,
-                )
+            let Some((label, filesystem)) = volume_info(&root) else {
+                pending.push(root);
+                continue;
             };
-            if ok == 0 {
-                continue; // unidad sin medio o sin formato
-            }
             let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
-            let space = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) } != 0;
-            out.push(Drive {
-                root: PathBuf::from(root),
-                label: from_wide(&label),
-                filesystem: from_wide(&fs),
+            let space = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut avail, &mut total, &mut free) } != 0;
+            ready.push(Drive {
+                root,
+                label,
+                filesystem,
                 total: space.then_some(total),
                 free: space.then_some(avail),
                 removable: kind == DRIVE_REMOVABLE,
                 marker: None,
             });
         }
-        out
+        (ready, pending)
     }
 }
 
 #[cfg(not(windows))]
 mod imp {
     use super::Drive;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+
+    fn mounts() -> String {
+        std::fs::read_to_string("/proc/mounts").unwrap_or_default()
+    }
+
+    pub fn token() -> u64 {
+        let digest = blake3::hash(mounts().as_bytes());
+        u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or_default())
+    }
+
+    pub fn is_ready(_root: &Path) -> bool {
+        false
+    }
 
     /// Solo para desarrollo: puntos de montaje de medios extraíbles.
-    pub fn list() -> Vec<Drive> {
-        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
-        mounts
+    pub fn list() -> (Vec<Drive>, Vec<PathBuf>) {
+        let drives = mounts()
             .lines()
             .filter_map(|line| {
                 let mut parts = line.split_whitespace();
@@ -180,6 +236,7 @@ mod imp {
                     marker: None,
                 })
             })
-            .collect()
+            .collect();
+        (drives, Vec::new())
     }
 }

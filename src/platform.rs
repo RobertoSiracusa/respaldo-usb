@@ -3,14 +3,25 @@
 
 pub const WINDOW_TITLE: &str = "Respaldo USB";
 
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum Instance {
+    /// No hay otra copia: esta sigue.
+    First,
+    /// Ya abierta en esta sesión; se trajo su ventana al frente.
+    SameSession,
+    /// Abierta por otro usuario del mismo servidor.
+    OtherSession,
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::WINDOW_TITLE;
+    use super::{Instance, WINDOW_TITLE};
     use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, IsIconic, SetForegroundWindow, ShowWindow, SW_HIDE, SW_RESTORE, SW_SHOW,
+        FindWindowW, IsIconic, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_RESTORE, SW_SHOW,
+        SetForegroundWindow, ShowWindow,
     };
 
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -20,20 +31,44 @@ mod imp {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// `false` si ya hay otra copia de la app corriendo en esta sesión.
-    pub fn single_instance() -> bool {
-        let name = wide("RespaldoUSB-instancia-unica");
+    /// Reserva la instancia única en todo el equipo (todas las sesiones de usuario).
+    pub fn claim_instance() -> Instance {
+        let name = wide(r"Global\RespaldoUSB-instancia-unica");
         // El handle se deja abierto a propósito: vive lo que viva el proceso.
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
-        !handle.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
-    }
-
-    pub fn show_existing_window() {
+        let error = unsafe { GetLastError() };
+        if !handle.is_null() && error != ERROR_ALREADY_EXISTS {
+            return Instance::First;
+        }
+        // Existe: o es de esta sesión (hay ventana que mostrar) o de otro usuario (acceso denegado o sin ventana).
         let title = wide(WINDOW_TITLE);
         let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-        if !hwnd.is_null() {
-            show_window(hwnd as isize);
+        if hwnd.is_null() {
+            return Instance::OtherSession;
         }
+        show_window(hwnd as isize);
+        Instance::SameSession
+    }
+
+    pub fn message_box(text: &str) {
+        let (text, title) = (wide(text), wide(WINDOW_TITLE));
+        unsafe {
+            MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                title.as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            )
+        };
+    }
+
+    /// Identificador estable de la instalación de Windows.
+    pub fn machine_guid() -> Option<String> {
+        use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+        winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey_with_flags(r"SOFTWARE\Microsoft\Cryptography", KEY_READ | KEY_WOW64_64KEY)
+            .and_then(|k| k.get_value::<String, _>("MachineGuid"))
+            .ok()
     }
 
     pub fn show_window(hwnd: isize) {
@@ -79,10 +114,15 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    pub fn single_instance() -> bool {
-        true
+    pub fn claim_instance() -> super::Instance {
+        super::Instance::First
     }
-    pub fn show_existing_window() {}
+    pub fn message_box(text: &str) {
+        eprintln!("{text}");
+    }
+    pub fn machine_guid() -> Option<String> {
+        None
+    }
     pub fn show_window(_hwnd: isize) {}
     pub fn hide_window(_hwnd: isize) {}
     pub fn autostart_enabled() -> bool {
@@ -102,8 +142,8 @@ pub const ARG_MINIMIZED: &str = "--minimizado";
 /// porque el bucle de la interfaz no corre mientras la ventana está oculta.
 #[cfg(windows)]
 pub mod tray {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
     use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -155,7 +195,11 @@ pub mod tray {
             wake_menu();
         }));
         TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-            if let TrayIconEvent::DoubleClick { button: MouseButton::Left, .. } = e {
+            if let TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } = e
+            {
                 super::show_window(hwnd);
                 wake();
             }

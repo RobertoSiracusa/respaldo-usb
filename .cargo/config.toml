@@ -1,0 +1,3 @@
+# Enlaza el runtime de C dentro del .exe: no hace falta instalar Visual C++ Redistributable en los servidores.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

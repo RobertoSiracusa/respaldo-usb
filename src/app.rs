@@ -1,0 +1,464 @@
+//! Interfaz gráfica (egui).
+
+use crate::config::{self, RegisteredDisk};
+use crate::controller::Controller;
+use crate::drives::{self, Drive};
+use crate::engine::Phase;
+use crate::platform;
+use eframe::egui;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Backup,
+    Folders,
+    Disks,
+    Settings,
+}
+
+pub struct App {
+    ctl: Arc<Controller>,
+    tab: Tab,
+    excludes_text: String,
+    message: Option<String>,
+    autostart: bool,
+    quit: Arc<AtomicBool>,
+    start_hidden: bool,
+    has_tray: bool,
+    #[cfg(windows)]
+    _tray: Option<tray_icon::TrayIcon>,
+}
+
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, ctl: Arc<Controller>, start_hidden: bool) -> Self {
+        let ctx = cc.egui_ctx.clone();
+        *ctl.wake.lock().unwrap() = Some(Box::new({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        }));
+        let quit = Arc::new(AtomicBool::new(false));
+
+        #[cfg(windows)]
+        let tray = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+                _ => 0,
+            };
+            ctl.hwnd.store(hwnd, Ordering::Relaxed);
+            platform::tray::create(hwnd, quit.clone(), move || ctx.request_repaint())
+        };
+        #[cfg(windows)]
+        let has_tray = tray.is_some();
+        #[cfg(not(windows))]
+        let has_tray = false;
+
+        ctl.refresh_drives();
+        ctl.spawn_watcher();
+        let excludes_text = ctl.config.lock().unwrap().excludes.join("\n");
+        Self {
+            ctl,
+            tab: Tab::Backup,
+            excludes_text,
+            message: None,
+            autostart: platform::autostart_enabled(),
+            quit,
+            start_hidden: start_hidden && has_tray,
+            has_tray,
+            #[cfg(windows)]
+            _tray: tray,
+        }
+    }
+
+    fn save_config(&mut self) {
+        if let Err(e) = self.ctl.config.lock().unwrap().save() {
+            self.message = Some(format!("No se pudo guardar la configuración: {e}"));
+        }
+    }
+
+    fn hwnd(&self) -> isize {
+        self.ctl.hwnd.load(Ordering::Relaxed)
+    }
+
+    fn tab_backup(&mut self, ui: &mut egui::Ui) {
+        let ready = self.ctl.ready_disks();
+        let running = self.ctl.is_running();
+        let n_sources = self.ctl.config.lock().unwrap().sources.len();
+
+        match ready.first() {
+            Some(d) => {
+                ui.label(
+                    egui::RichText::new(format!("Disco conectado: {}", drive_title(d)))
+                        .color(egui::Color32::from_rgb(40, 150, 70))
+                        .strong(),
+                );
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new("Ningún disco de respaldo conectado")
+                        .color(egui::Color32::from_rgb(200, 120, 0))
+                        .strong(),
+                );
+                ui.label("Conecta un disco registrado, o registra uno en la pestaña Discos.");
+            }
+        }
+        if n_sources == 0 {
+            ui.label("No hay carpetas seleccionadas. Añádelas en la pestaña Carpetas.");
+        }
+        ui.add_space(8.0);
+
+        if running {
+            let p = self.ctl.reporter.progress.lock().unwrap().clone();
+            let title = match p.phase {
+                Phase::Scanning => "Contando archivos…",
+                Phase::Copying => "Respaldando…",
+                Phase::Verifying => "Verificando disco…",
+                Phase::Idle => "Terminando…",
+            };
+            ui.heading(title);
+            let frac = if p.phase == Phase::Scanning || p.bytes_total == 0 {
+                if p.files_total > 0 && p.phase != Phase::Scanning { p.files_done as f32 / p.files_total as f32 } else { 0.0 }
+            } else {
+                p.bytes_done as f32 / p.bytes_total as f32
+            };
+            ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0)).show_percentage());
+            ui.label(format!(
+                "{} de {} archivos · {} de {}",
+                p.files_done,
+                p.files_total,
+                human(p.bytes_done.min(p.bytes_total)),
+                human(p.bytes_total)
+            ));
+            ui.add(egui::Label::new(egui::RichText::new(&p.current).small()).truncate());
+            if ui.button("Cancelar").clicked() {
+                self.ctl.cancel();
+            }
+            ui.label("No desconectes el disco mientras trabaja.");
+        } else {
+            ui.horizontal(|ui| {
+                let can = !ready.is_empty() && n_sources > 0;
+                let big = egui::Button::new(egui::RichText::new("Respaldar ahora").size(18.0));
+                if ui.add_enabled(can, big).clicked() {
+                    self.ctl.start_backup(&ready[0].root);
+                }
+                if ui
+                    .add_enabled(!ready.is_empty(), egui::Button::new("Verificar disco"))
+                    .on_hover_text("Relee todo el respaldo de este servidor y lo compara con los hashes guardados. Lo dañado se vuelve a copiar en el siguiente respaldo.")
+                    .clicked()
+                {
+                    self.ctl.start_verify(&ready[0].root);
+                }
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        let last = self.ctl.last.lock().unwrap();
+        let Some(last) = last.as_ref() else {
+            ui.label("Sin respaldos en esta sesión.");
+            return;
+        };
+        let s = &last.summary;
+        let when: chrono::DateTime<chrono::Local> = last.when.into();
+        let kind = if s.verify { "Verificación" } else { "Respaldo" };
+        let (text, color) = if let Some(f) = &s.fatal {
+            (format!("{kind} DETENIDO: {f}"), egui::Color32::from_rgb(210, 50, 50))
+        } else if s.cancelled {
+            (format!("{kind} cancelado"), egui::Color32::from_rgb(200, 120, 0))
+        } else if s.issues_total > 0 {
+            (format!("{kind} terminado con {} incidencias", s.issues_total), egui::Color32::from_rgb(200, 120, 0))
+        } else {
+            (format!("{kind} completo"), egui::Color32::from_rgb(40, 150, 70))
+        };
+        ui.label(egui::RichText::new(text).color(color).strong().size(16.0));
+        ui.label(format!("{} · disco {} · {:.0} s", when.format("%Y-%m-%d %H:%M"), last.disk, s.seconds));
+        if s.verify {
+            ui.label(format!("Archivos correctos: {}", s.unchanged));
+        } else {
+            ui.label(format!(
+                "Copiados: {} ({}) · Sin cambios: {} · Conservados sin origen: {}",
+                s.copied,
+                human(s.copied_bytes),
+                s.unchanged,
+                s.only_in_backup
+            ));
+        }
+        if s.ok() && !s.verify {
+            ui.label("Antes de desconectar, usa \"Quitar hardware de forma segura\".");
+        }
+        if let Some(report) = &last.report {
+            if ui.link("Abrir reporte").clicked() {
+                open_path(report);
+            }
+        }
+        if !s.issues.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Omitidos o con error:").strong());
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(
+                ui,
+                ui.text_style_height(&egui::TextStyle::Body),
+                s.issues.len(),
+                |ui, range| {
+                    for (path, why) in &s.issues[range] {
+                        ui.add(egui::Label::new(format!("{path} — {why}")).truncate());
+                    }
+                },
+            );
+        }
+    }
+
+    fn tab_folders(&mut self, ui: &mut egui::Ui) {
+        let running = self.ctl.is_running();
+        ui.label("Carpetas de este servidor que se respaldan:");
+        let mut remove = None;
+        let sources = self.ctl.config.lock().unwrap().sources.clone();
+        egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
+            for (i, src) in sources.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!running, egui::Button::new("Quitar")).clicked() {
+                        remove = Some(i);
+                    }
+                    ui.label(src.display().to_string());
+                    if !src.is_dir() {
+                        ui.label(egui::RichText::new("(no accesible)").color(egui::Color32::from_rgb(210, 50, 50)));
+                    }
+                });
+            }
+        });
+        if let Some(i) = remove {
+            self.ctl.config.lock().unwrap().sources.remove(i);
+            self.save_config();
+        }
+        if ui.add_enabled(!running, egui::Button::new("Añadir carpeta…")).clicked() {
+            if let Some(picked) = rfd::FileDialog::new().set_title("Carpetas a respaldar").pick_folders() {
+                {
+                    let mut cfg = self.ctl.config.lock().unwrap();
+                    for p in picked {
+                        if !cfg.sources.contains(&p) {
+                            cfg.sources.push(p);
+                        }
+                    }
+                }
+                self.save_config();
+            }
+        }
+        ui.label("Quitar una carpeta no borra lo ya respaldado en el disco.");
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label("Exclusiones (un patrón por línea; * y ? como comodines, sin distinguir mayúsculas):");
+        let edit = egui::TextEdit::multiline(&mut self.excludes_text).desired_rows(6).desired_width(f32::INFINITY);
+        if ui.add_enabled(!running, edit).changed() {
+            self.ctl.config.lock().unwrap().excludes =
+                self.excludes_text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
+            self.save_config();
+        }
+        ui.label(egui::RichText::new("Ejemplos: *.tmp   ~$*   node_modules   *\\Cache\\*").small());
+    }
+
+    fn tab_disks(&mut self, ui: &mut egui::Ui) {
+        let running = self.ctl.is_running();
+        let list = self.ctl.drives.lock().unwrap().clone();
+        ui.horizontal(|ui| {
+            ui.label("Discos detectados:");
+            if ui.small_button("Actualizar").clicked() {
+                self.ctl.refresh_drives();
+            }
+        });
+        if list.is_empty() {
+            ui.label("Ninguno. Conecta el disco extraíble.");
+        }
+        for d in &list {
+            let registered = d.marker.as_ref().is_some_and(|m| self.ctl.config.lock().unwrap().is_registered(&m.id));
+            ui.horizontal(|ui| {
+                if registered {
+                    ui.label(egui::RichText::new("✔ registrado").color(egui::Color32::from_rgb(40, 150, 70)));
+                } else if ui.add_enabled(!running, egui::Button::new("Usar para respaldo")).clicked() {
+                    self.register(d);
+                }
+                ui.label(drive_title(d));
+                if !d.removable {
+                    ui.label(egui::RichText::new("(disco fijo o disco duro USB)").small());
+                }
+            });
+            if d.filesystem.eq_ignore_ascii_case("FAT32") || d.filesystem.eq_ignore_ascii_case("FAT") {
+                ui.label(
+                    egui::RichText::new("    Formato FAT32: no admite archivos de más de 4 GB. Mejor NTFS o exFAT.")
+                        .color(egui::Color32::from_rgb(200, 120, 0)),
+                );
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label("Discos autorizados en este servidor:");
+        let disks = self.ctl.config.lock().unwrap().disks.clone();
+        if disks.is_empty() {
+            ui.label("Ninguno todavía.");
+        }
+        let mut forget = None;
+        for (i, disk) in disks.iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!running, egui::Button::new("Olvidar")).clicked() {
+                    forget = Some(i);
+                }
+                ui.label(format!("{} (id {})", disk.name, disk.id));
+            });
+        }
+        if let Some(i) = forget {
+            self.ctl.config.lock().unwrap().disks.remove(i);
+            self.save_config();
+        }
+        ui.label("Olvidar un disco no borra su contenido. El mismo disco puede registrarse en varios servidores: cada uno guarda en su propia carpeta.");
+    }
+
+    fn register(&mut self, d: &Drive) {
+        let name = if d.label.is_empty() { d.root.display().to_string() } else { d.label.clone() };
+        match drives::register(&d.root, &name) {
+            Ok(marker) => {
+                {
+                    let mut cfg = self.ctl.config.lock().unwrap();
+                    if !cfg.is_registered(&marker.id) {
+                        cfg.disks.push(RegisteredDisk { id: marker.id, name: marker.name });
+                    }
+                }
+                self.save_config();
+                self.ctl.refresh_drives();
+            }
+            Err(e) => self.message = Some(format!("No se pudo preparar el disco {}: {e}", d.root.display())),
+        }
+    }
+
+    fn tab_settings(&mut self, ui: &mut egui::Ui) {
+        let mut cfg = self.ctl.config.lock().unwrap().clone();
+        let mut changed = false;
+        changed |= ui
+            .checkbox(&mut cfg.auto_on_connect, "Respaldar automáticamente al conectar un disco registrado")
+            .on_hover_text("La app debe estar abierta (puede estar oculta en la bandeja).")
+            .changed();
+        changed |= ui
+            .checkbox(&mut cfg.verify_after_copy, "Releer cada archivo copiado para confirmar la escritura")
+            .on_hover_text("Más lento, sobre todo con muchos archivos pequeños, pero detecta fallos del disco o del cable al momento.")
+            .changed();
+        if changed {
+            *self.ctl.config.lock().unwrap() = cfg;
+            self.save_config();
+        }
+
+        if cfg!(windows) {
+            if ui
+                .checkbox(&mut self.autostart, "Iniciar con Windows, oculta en la bandeja")
+                .on_hover_text("Se inicia al abrir sesión con este usuario. Sin sesión abierta no hay respaldo automático.")
+                .changed()
+            {
+                if let Err(e) = platform::set_autostart(self.autostart) {
+                    self.message = Some(format!("No se pudo cambiar el inicio automático: {e}"));
+                    self.autostart = platform::autostart_enabled();
+                }
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(format!("Servidor: {}", config::hostname()));
+        ui.label(format!("Destino en el disco: {}\\{}\\…", config::APP_DIR, config::hostname()));
+        if ui.link("Abrir carpeta de reportes").clicked() {
+            let dir = config::logs_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            open_path(&dir);
+        }
+    }
+}
+
+impl eframe::App for App {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.start_hidden {
+            self.start_hidden = false;
+            platform::hide_window(self.hwnd());
+        }
+
+        let quitting = self.quit.load(Ordering::Relaxed);
+        if ctx.input(|i| i.viewport().close_requested()) && !quitting {
+            if self.has_tray {
+                // Cerrar la ventana solo la oculta: la app sigue en la bandeja esperando discos.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                platform::hide_window(self.hwnd());
+            } else if self.ctl.is_running() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.quit.store(true, Ordering::Relaxed);
+            }
+        }
+        if quitting {
+            // Salida ordenada: cancelar, esperar a que el hilo guarde el manifiesto y cerrar.
+            if self.ctl.is_running() {
+                self.ctl.cancel();
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.request_repaint_after(Duration::from_millis(100));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        if self.ctl.is_running() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Backup, "Respaldo");
+                ui.selectable_value(&mut self.tab, Tab::Folders, "Carpetas");
+                ui.selectable_value(&mut self.tab, Tab::Disks, "Discos");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Ajustes");
+            });
+            ui.separator();
+            if let Some(msg) = self.message.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(msg).color(egui::Color32::from_rgb(210, 50, 50)));
+                    if ui.small_button("Cerrar aviso").clicked() {
+                        self.message = None;
+                    }
+                });
+            }
+            match self.tab {
+                Tab::Backup => self.tab_backup(ui),
+                Tab::Folders => self.tab_folders(ui),
+                Tab::Disks => self.tab_disks(ui),
+                Tab::Settings => self.tab_settings(ui),
+            }
+        });
+    }
+}
+
+fn drive_title(d: &Drive) -> String {
+    let mut s = d.root.display().to_string();
+    if !d.label.is_empty() {
+        s.push_str(&format!(" [{}]", d.label));
+    }
+    if let (Some(free), Some(total)) = (d.free, d.total) {
+        s.push_str(&format!(" · {} libres de {}", human(free), human(total)));
+    }
+    if !d.filesystem.is_empty() {
+        s.push_str(&format!(" · {}", d.filesystem));
+    }
+    s
+}
+
+fn human(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 { format!("{bytes} B") } else { format!("{v:.1} {}", UNITS[u]) }
+}
+
+fn open_path(path: &Path) {
+    let program = if cfg!(windows) { "explorer" } else { "xdg-open" };
+    let _ = std::process::Command::new(program).arg(path).spawn();
+}

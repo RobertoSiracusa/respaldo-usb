@@ -1,0 +1,185 @@
+//! Detección de discos y marcador que identifica un disco de respaldo.
+//!
+//! El disco se reconoce por el archivo `RespaldoUSB/disco.json` que lleva dentro,
+//! no por su letra: Windows puede asignarle una letra distinta en cada servidor.
+
+use crate::config::APP_DIR;
+use serde::{Deserialize, Serialize};
+use std::io;
+use std::path::{Path, PathBuf};
+
+const MARKER_NAME: &str = "disco.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiskMarker {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Drive {
+    pub root: PathBuf,
+    pub label: String,
+    pub filesystem: String,
+    pub total: Option<u64>,
+    pub free: Option<u64>,
+    /// Windows lo reporta como extraíble (memorias USB). Los discos duros USB salen como fijos.
+    pub removable: bool,
+    pub marker: Option<DiskMarker>,
+}
+
+pub fn backup_root(disk_root: &Path) -> PathBuf {
+    disk_root.join(APP_DIR)
+}
+
+fn read_marker(root: &Path) -> Option<DiskMarker> {
+    let bytes = std::fs::read(backup_root(root).join(MARKER_NAME)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Marca el disco como destino de respaldo. Si ya tenía marcador, lo reutiliza.
+pub fn register(root: &Path, name: &str) -> io::Result<DiskMarker> {
+    if let Some(m) = read_marker(root) {
+        return Ok(m);
+    }
+    let seed = format!(
+        "{:?}|{}|{}",
+        std::time::SystemTime::now(),
+        std::process::id(),
+        root.display()
+    );
+    let marker = DiskMarker {
+        id: blake3::hash(seed.as_bytes()).to_hex()[..16].to_string(),
+        name: name.to_string(),
+    };
+    let dir = backup_root(root);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(MARKER_NAME), serde_json::to_vec_pretty(&marker)?)?;
+    Ok(marker)
+}
+
+pub fn list_drives() -> Vec<Drive> {
+    let mut drives = imp::list();
+    // Para pruebas: carpetas que se tratan como discos (separadas por ';').
+    if let Ok(extra) = std::env::var("RESPALDO_DISCOS_PRUEBA") {
+        for p in extra.split(';').filter(|p| !p.is_empty()) {
+            let root = PathBuf::from(p);
+            if root.is_dir() {
+                drives.push(Drive {
+                    label: "prueba".into(),
+                    filesystem: String::new(),
+                    total: None,
+                    free: None,
+                    removable: true,
+                    marker: None,
+                    root,
+                });
+            }
+        }
+    }
+    for d in &mut drives {
+        d.marker = read_marker(&d.root);
+    }
+    drives
+}
+
+#[cfg(windows)]
+mod imp {
+    use super::Drive;
+    use std::path::PathBuf;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
+
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+    const SEM_FAILCRITICALERRORS: u32 = 1;
+
+    fn from_wide(buf: &[u16]) -> String {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+    }
+
+    pub fn list() -> Vec<Drive> {
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_ascii_uppercase();
+        let mut out = Vec::new();
+        // Evita el diálogo "no hay disco en la unidad" de lectores de tarjetas vacíos.
+        unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
+        let mask = unsafe { GetLogicalDrives() };
+        for i in 0..26u32 {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let letter = (b'A' + i as u8) as char;
+            if system.starts_with(letter) {
+                continue;
+            }
+            let root = format!("{letter}:\\");
+            let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+            let kind = unsafe { GetDriveTypeW(wide.as_ptr()) };
+            if kind != DRIVE_REMOVABLE && kind != DRIVE_FIXED {
+                continue;
+            }
+            let mut label = [0u16; 261];
+            let mut fs = [0u16; 261];
+            let ok = unsafe {
+                GetVolumeInformationW(
+                    wide.as_ptr(),
+                    label.as_mut_ptr(),
+                    label.len() as u32,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    fs.as_mut_ptr(),
+                    fs.len() as u32,
+                )
+            };
+            if ok == 0 {
+                continue; // unidad sin medio o sin formato
+            }
+            let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
+            let space = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut avail, &mut total, &mut free) } != 0;
+            out.push(Drive {
+                root: PathBuf::from(root),
+                label: from_wide(&label),
+                filesystem: from_wide(&fs),
+                total: space.then_some(total),
+                free: space.then_some(avail),
+                removable: kind == DRIVE_REMOVABLE,
+                marker: None,
+            });
+        }
+        out
+    }
+}
+
+#[cfg(not(windows))]
+mod imp {
+    use super::Drive;
+    use std::path::PathBuf;
+
+    /// Solo para desarrollo: puntos de montaje de medios extraíbles.
+    pub fn list() -> Vec<Drive> {
+        let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
+        mounts
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let _dev = parts.next()?;
+                let mount = parts.next()?.replace("\\040", " ");
+                let fs = parts.next()?;
+                let removable = mount.starts_with("/run/media/") || mount.starts_with("/media/");
+                (removable || mount.starts_with("/mnt/")).then(|| Drive {
+                    label: mount.rsplit('/').next().unwrap_or("").to_string(),
+                    root: PathBuf::from(&mount),
+                    filesystem: fs.to_string(),
+                    total: None,
+                    free: None,
+                    removable,
+                    marker: None,
+                })
+            })
+            .collect()
+    }
+}

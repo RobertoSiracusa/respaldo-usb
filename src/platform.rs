@@ -16,38 +16,68 @@ pub enum Instance {
 #[cfg(windows)]
 mod imp {
     use super::{Instance, WINDOW_TITLE};
+
     use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
-    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, IsIconic, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_RESTORE, SW_SHOW,
+        IsIconic, IsWindowVisible, MB_ICONINFORMATION, MB_OK, MessageBoxW, SW_HIDE, SW_RESTORE, SW_SHOW,
         SetForegroundWindow, ShowWindow,
     };
 
     const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
     const RUN_VALUE: &str = "RespaldoUSB";
+    /// Handle del evento por el que otra copia pide mostrar la ventana.
+    static SHOW_EVENT: AtomicIsize = AtomicIsize::new(0);
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     /// Reserva la instancia única en todo el equipo (todas las sesiones de usuario).
+    /// Si ya hay una en esta sesión, le pide que muestre su ventana.
     pub fn claim_instance() -> Instance {
         let name = wide(r"Global\RespaldoUSB-instancia-unica");
         // El handle se deja abierto a propósito: vive lo que viva el proceso.
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         let error = unsafe { GetLastError() };
+        // El evento es local a la sesión: solo lo ve una copia abierta por este mismo usuario.
+        let event_name = wide(r"Local\RespaldoUSB-mostrar");
         if !handle.is_null() && error != ERROR_ALREADY_EXISTS {
+            let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr()) };
+            SHOW_EVENT.store(event as isize, Ordering::Relaxed);
             return Instance::First;
         }
-        // Existe: o es de esta sesión (hay ventana que mostrar) o de otro usuario (acceso denegado o sin ventana).
-        let title = wide(WINDOW_TITLE);
-        let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
-        if hwnd.is_null() {
+        let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr()) };
+        if event.is_null() {
             return Instance::OtherSession;
         }
-        show_window(hwnd as isize);
+        unsafe {
+            SetEvent(event);
+            CloseHandle(event);
+        }
         Instance::SameSession
+    }
+
+    /// Atiende las peticiones de "muestra tu ventana" que envía una segunda copia al abrirse.
+    pub fn listen_show_requests(hwnd: isize, on_show: impl Fn() + Send + 'static) {
+        let event = SHOW_EVENT.load(Ordering::Relaxed);
+        if event == 0 {
+            return;
+        }
+        std::thread::spawn(move || {
+            while unsafe { WaitForSingleObject(event as *mut c_void, INFINITE) } == WAIT_OBJECT_0 {
+                on_show();
+                show_window(hwnd);
+            }
+        });
+    }
+
+    pub fn is_visible(hwnd: isize) -> bool {
+        hwnd != 0 && unsafe { IsWindowVisible(hwnd as *mut c_void) } != 0
     }
 
     pub fn message_box(text: &str) {
@@ -120,6 +150,9 @@ mod imp {
     pub fn message_box(text: &str) {
         eprintln!("{text}");
     }
+    pub fn is_visible(_hwnd: isize) -> bool {
+        true
+    }
     pub fn machine_guid() -> Option<String> {
         None
     }
@@ -145,7 +178,7 @@ pub mod tray {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-    use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
+    use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
     fn icon() -> Icon {
         // Disco azul sobre fondo transparente, generado en código.
@@ -168,7 +201,7 @@ pub mod tray {
         Icon::from_rgba(rgba, N, N).expect("icono válido")
     }
 
-    /// Crea el icono. `quit` se activa al elegir "Salir"; `wake` despierta la interfaz.
+    /// Crea el icono. `quit` se activa al elegir "Salir"; `wake` se llama justo antes de mostrar la ventana.
     pub fn create(hwnd: isize, quit: Arc<AtomicBool>, wake: impl Fn() + Send + Sync + 'static) -> Option<TrayIcon> {
         let menu = Menu::new();
         let open = MenuItem::new("Abrir", true, None);
@@ -177,6 +210,8 @@ pub mod tray {
         menu.append(&exit).ok()?;
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
+            // Clic izquierdo abre la ventana; el menú queda en el clic derecho.
+            .with_menu_on_left_click(false)
             .with_tooltip(super::WINDOW_TITLE)
             .with_icon(icon())
             .build()
@@ -191,17 +226,18 @@ pub mod tray {
             } else if e.id != open_id {
                 return;
             }
-            super::show_window(hwnd);
             wake_menu();
+            super::show_window(hwnd);
         }));
         TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
-            if let TrayIconEvent::DoubleClick {
+            if let TrayIconEvent::Click {
                 button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
                 ..
             } = e
             {
-                super::show_window(hwnd);
                 wake();
+                super::show_window(hwnd);
             }
         }));
         Some(tray)

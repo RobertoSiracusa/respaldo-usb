@@ -16,6 +16,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const POLL: Duration = Duration::from_secs(3);
 /// Incidencias que se conservan en el estado guardado; la lista completa va en el reporte.
 const STORED_ISSUES: usize = 300;
+/// Reportes que se conservan; al superar el tope se borran los más antiguos.
+const KEEP_REPORTS: usize = 200;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct LastRun {
@@ -255,7 +257,28 @@ fn write_report(summary: &Summary, when: SystemTime) -> Option<PathBuf> {
     let kind = if summary.verify { "verificacion" } else { "respaldo" };
     let path = dir.join(format!("{}_{kind}.txt", stamp.format("%Y-%m-%d_%H%M%S")));
     std::fs::write(&path, engine::report_text(summary, when)).ok()?;
+    prune_reports(&dir, KEEP_REPORTS);
     Some(path)
+}
+
+/// Deja solo los `keep` reportes más recientes. El nombre empieza por la fecha, así que ordenar por nombre basta.
+fn prune_reports(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut reports: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            name.ends_with("_respaldo.txt") || name.ends_with("_verificacion.txt")
+        })
+        .collect();
+    reports.sort();
+    let excess = reports.len().saturating_sub(keep);
+    for old in &reports[..excess] {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +323,31 @@ mod tests {
         assert_eq!(
             newly_connected(&none, &[drive("E:\\", Some("otro")), drive("F:\\", None)], &cfg),
             None
+        );
+    }
+
+    #[test]
+    fn old_reports_are_pruned_and_other_files_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        for day in 1..=5 {
+            std::fs::write(dir.path().join(format!("2026-01-0{day}_100000_respaldo.txt")), "r").unwrap();
+        }
+        std::fs::write(dir.path().join("2026-01-03_110000_verificacion.txt"), "v").unwrap();
+        std::fs::write(dir.path().join("errores.log"), "e").unwrap();
+
+        prune_reports(dir.path(), 2);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "2026-01-04_100000_respaldo.txt",
+                "2026-01-05_100000_respaldo.txt",
+                "errores.log"
+            ]
         );
     }
 

@@ -240,3 +240,36 @@ mod imp {
         (drives, Vec::new())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registering_marks_the_disk_once() {
+        let disk = tempfile::tempdir().unwrap();
+        assert_eq!(read_marker(disk.path()), None);
+
+        let first = register(disk.path(), "Disco A").unwrap();
+        assert_eq!(first.name, "Disco A");
+        assert_eq!(first.id.len(), 16);
+        assert_eq!(read_marker(disk.path()), Some(first.clone()));
+        assert!(backup_root(disk.path()).join(MARKER_NAME).is_file());
+
+        // Otro servidor registra el mismo disco: conserva identidad y nombre.
+        assert_eq!(register(disk.path(), "Otro nombre").unwrap(), first);
+    }
+
+    #[test]
+    fn unreadable_marker_means_not_a_backup_disk() {
+        let disk = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(backup_root(disk.path())).unwrap();
+        std::fs::write(backup_root(disk.path()).join(MARKER_NAME), "no es json").unwrap();
+        assert_eq!(read_marker(disk.path()), None);
+    }
+
+    #[test]
+    fn snapshot_is_fresh_right_after_taking_it() {
+        assert!(!Snapshot::take().is_stale());
+    }
+}
